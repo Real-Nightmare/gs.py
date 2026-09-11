@@ -42,120 +42,181 @@ CHUNK_SIZE_MB = 500
 
 def load_tokens():
     if not tokens_file.exists():
+        print("Error: Tokens file not found. Run 'python gs.py token add' first.")
         sys.exit(1)
-    with open(tokens_file) as f:
-        data = json.load(f)
+    try:
+        with open(tokens_file) as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        print("Error: Tokens file is corrupted.")
+        sys.exit(1)
     tokens = data.get("tokens", [])
     if not tokens:
+        print("Error: No tokens found. Run 'python gs.py token add' first.")
         sys.exit(1)
     return tokens
 
 
 def save_tokens(tokens):
+    tokens_file.parent.mkdir(parents=True, exist_ok=True)
     tokens_file.write_text(json.dumps({"tokens": tokens}, indent=2))
 
 
 def add_token(token):
     tokens = []
     if tokens_file.exists():
-        with open(tokens_file) as f:
-            tokens = json.load(f).get("tokens", [])
+        try:
+            with open(tokens_file) as f:
+                tokens = json.load(f).get("tokens", [])
+        except json.JSONDecodeError:
+            tokens = []
     if len(tokens) >= 5:
+        print("Error: Maximum 5 tokens allowed.")
         sys.exit(1)
     if token in tokens:
+        print("Error: Token already exists.")
         sys.exit(1)
     tokens.append(token)
     save_tokens(tokens)
+    print("Token added successfully.")
 
 
 def remove_token(index):
     tokens = load_tokens()
     if index < 1 or index > len(tokens):
+        print(f"Error: Invalid index. Valid range is 1-{len(tokens)}.")
         sys.exit(1)
-    tokens.pop(index - 1)
+    removed = tokens.pop(index - 1)
     save_tokens(tokens)
+    print(f"Token removed: {removed[:6]}...")
 
 
 def list_tokens():
     tokens = load_tokens()
+    print("Saved tokens:")
     for i, t in enumerate(tokens, 1):
-        print(f"  {i}. {t[:6]}... ({len(t)})")
+        print(f"  {i}. {t[:6]}... ({len(t)} chars)")
 
 
 def parse_github_url(url):
-    parsed = urlparse(url)
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) < 2:
-        raise ValueError("bad url")
-    owner, repo = parts[0], parts[1]
-    file_path = None
-    if len(parts) >= 5 and parts[2] == "blob":
-        file_path = "/".join(parts[4:])
-        if not file_path.endswith(("index.html", "index.svg")):
-            raise ValueError("needs index.html or index.svg")
-    return owner, repo, file_path
+    try:
+        parsed = urlparse(url)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 2:
+            raise ValueError("URL must contain owner and repo")
+        owner, repo = parts[0], parts[1]
+        file_path = None
+        if len(parts) >= 5 and parts[2] == "blob":
+            file_path = "/".join(parts[4:])
+            if not file_path.endswith(("index.html", "index.svg")):
+                raise ValueError("File must be index.html or index.svg")
+        return owner, repo, file_path
+    except Exception as e:
+        print(f"Error parsing URL: {e}")
+        sys.exit(1)
 
 
 def get_fork(owner, repo, token):
     headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    me = requests.get(f"{github_api}/user", headers=headers)
-    me.raise_for_status()
-    user = me.json()["login"]
-    forks = requests.get(f"{github_api}/repos/{owner}/{repo}/forks", headers=headers).json()
-    for fork in forks:
-        if fork["owner"]["login"] == user:
-            return user, fork["name"]
-    resp = requests.post(f"{github_api}/repos/{owner}/{repo}/forks", headers=headers)
-    if resp.status_code != 202:
+    try:
+        me = requests.get(f"{github_api}/user", headers=headers, timeout=10)
+        me.raise_for_status()
+        user = me.json()["login"]
+    except requests.RequestException as e:
+        print(f"Error getting user info: {e}")
         sys.exit(1)
-    fork = resp.json()
-    for _ in range(30):
+
+    try:
+        forks = requests.get(f"{github_api}/repos/{owner}/{repo}/forks", headers=headers, timeout=10).json()
+        for fork in forks:
+            if fork["owner"]["login"] == user:
+                return user, fork["name"]
+    except requests.RequestException as e:
+        print(f"Error listing forks: {e}")
+
+    try:
+        resp = requests.post(f"{github_api}/repos/{owner}/{repo}/forks", headers=headers, timeout=10)
+        if resp.status_code != 202:
+            print(f"Error: GitHub returned {resp.status_code}")
+            sys.exit(1)
+        fork = resp.json()
+    except requests.RequestException as e:
+        print(f"Error creating fork: {e}")
+        sys.exit(1)
+
+    # Wait for fork to be ready
+    for attempt in range(30):
         try:
-            check = requests.get(f"{github_api}/repos/{fork['full_name']}", headers=headers)
+            check = requests.get(f"{github_api}/repos/{fork['full_name']}", headers=headers, timeout=10)
             if check.status_code == 200:
-                break
-        except:
+                return fork["owner"]["login"], fork["name"]
+        except requests.RequestException:
             pass
         time.sleep(0.5)
-    return fork["owner"]["login"], fork["name"]
+    
+    print("Error: Fork creation timed out")
+    sys.exit(1)
 
 
 def run_cmd(cmd, cwd=None, check=True):
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    if check and result.returncode != 0:
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+        if check and result.returncode != 0:
+            print(f"Command failed: {' '.join(cmd)}")
+            print(f"Error: {result.stderr}")
+            sys.exit(1)
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out: {' '.join(cmd)}")
         sys.exit(1)
-    return result.stdout.strip()
+    except Exception as e:
+        print(f"Command error: {e}")
+        sys.exit(1)
 
 
 def gofile_guest_token():
-    resp = requests.post("https://api.gofile.io/accounts", timeout=15)
-    data = resp.json()
-    if data["status"] == "ok":
-        return data["data"]["token"]
-    raise RuntimeError(f"couldnt get gofile token: {resp.text[:200]}")
+    try:
+        resp = requests.post("https://api.gofile.io/accounts", timeout=15)
+        data = resp.json()
+        if data.get("status") == "ok":
+            return data["data"]["token"]
+        raise RuntimeError(f"Failed to get gofile token: {resp.text[:200]}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network error getting gofile token: {e}")
 
 
 def gofile_server(token):
-    resp = requests.get("https://api.gofile.io/servers",
-                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
-    return resp.json()["data"]["servers"][0]["name"]
+    try:
+        resp = requests.get("https://api.gofile.io/servers",
+                            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        resp.raise_for_status()
+        servers = resp.json()["data"]["servers"]
+        if not servers:
+            raise RuntimeError("No servers available")
+        return servers[0]["name"]
+    except requests.RequestException as e:
+        raise RuntimeError(f"Error getting gofile server: {e}")
 
 
 def gofile_make_folder(token):
-    server = gofile_server(token)
-    resp = requests.post(
-        f"https://{server}.gofile.io/contents/uploadfile",
-        headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("credits.txt", CREDITS.encode(), "text/plain")},
-        timeout=60
-    )
-    data = resp.json()
-    if data["status"] != "ok":
-        return None, None
-    folder_id = data["data"]["parentFolder"]
-    page = data["data"]["downloadPage"]
-    credits_file_id = data["data"]["id"]
-    return folder_id, page, credits_file_id
+    try:
+        server = gofile_server(token)
+        resp = requests.post(
+            f"https://{server}.gofile.io/contents/uploadfile",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"file": ("credits.txt", CREDITS.encode(), "text/plain")},
+            timeout=60
+        )
+        data = resp.json()
+        if data.get("status") != "ok":
+            return None, None, None
+        folder_id = data["data"]["parentFolder"]
+        page = data["data"]["downloadPage"]
+        credits_file_id = data["data"]["id"]
+        return folder_id, page, credits_file_id
+    except Exception as e:
+        print(f"Warning: Could not create gofile folder: {e}")
+        return None, None, None
 
 
 def gofile_verify_credits(token, credits_file_id):
@@ -166,7 +227,7 @@ def gofile_verify_credits(token, credits_file_id):
             timeout=15
         )
         data = resp.json()
-        if data["status"] != "ok":
+        if data.get("status") != "ok":
             return False
         name = data["data"].get("name", "")
         return name == "credits.txt"
@@ -231,10 +292,10 @@ class GofileWriter:
                     print(f"chunk {num} gofile sent something weird: {txt[:300]!r}")
                     time.sleep(3)
                     continue
-                if data["status"] == "ok":
+                if data.get("status") == "ok":
                     try:
                         Path(fpath).unlink()
-                    except:
+                    except Exception:
                         pass
                     return
                 print(f"chunk {num} gofile said: {txt[:200]}")
@@ -245,7 +306,7 @@ class GofileWriter:
         print(f"chunk {num} gave up after 3 tries")
         try:
             Path(fpath).unlink()
-        except:
+        except Exception:
             pass
 
     def writelines(self, lines):
@@ -362,6 +423,8 @@ def process_token_streaming(token, owner, repo, file_path, commits_needed,
             for m in range(prev_m + 1, curr_m + 1):
                 print(f"{m}M done")
 
+    except Exception as e:
+        print(f"Error processing token: {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -372,12 +435,18 @@ def create_links(number, github_url, cdn_choice):
 
     if not file_path:
         headers = {"Authorization": f"token {tokens[0]}", "Accept": "application/vnd.github.v3+json"}
-        contents = requests.get(f"{github_api}/repos/{owner}/{repo}/contents/", headers=headers).json()
-        for item in contents:
-            if item["type"] == "file" and item["name"] in ("index.html", "index.svg"):
-                file_path = item["name"]
-                break
+        try:
+            contents = requests.get(f"{github_api}/repos/{owner}/{repo}/contents/", headers=headers, timeout=10).json()
+            for item in contents:
+                if item.get("type") == "file" and item.get("name") in ("index.html", "index.svg"):
+                    file_path = item["name"]
+                    break
+        except requests.RequestException as e:
+            print(f"Error fetching repository contents: {e}")
+            sys.exit(1)
+        
         if not file_path:
+            print("Error: No index.html or index.svg found in repository root")
             sys.exit(1)
 
     is_svg = file_path.endswith(".svg")
@@ -387,18 +456,18 @@ def create_links(number, github_url, cdn_choice):
             selected_cdns = list(cdn_domains.values())
         else:
             selected_cdns = [v for v in cdn_domains.values() if v not in svg_only]
-            print("html file detected, skipping svg-only cdns")
+            print("HTML file detected, skipping SVG-only CDNs")
     elif cdn_choice in cdn_domains:
         chosen = cdn_domains[cdn_choice]
         if not is_svg and chosen in svg_only:
-            print(f"{chosen} only works for svg files, your file is html")
+            print(f"Error: {chosen} only works for SVG files, but your file is HTML")
             sys.exit(1)
         selected_cdns = [chosen]
     else:
-        print("use either 1-13 for an specific cdn and 14 for every cdn bru")
-        sys.exit(0)
+        print("Error: Use either 1-13 for a specific CDN or 14 for all CDNs")
+        sys.exit(1)
 
-    print(f"using {len(selected_cdns)} cdn(s)")
+    print(f"Using {len(selected_cdns)} CDN(s)")
 
     per_token = number // len(tokens)
     remainder = number % len(tokens)
@@ -407,18 +476,20 @@ def create_links(number, github_url, cdn_choice):
     try:
         token = gofile_guest_token()
     except Exception as e:
-        print(f"couldnt get gofile token: {e}")
-        sys.exit(1)
-
-    folder_id, folder_link, credits_file_id = gofile_make_folder(token)
-    if folder_link:
-        print(f"gofile: {folder_link}")
+        print(f"Warning: Could not get gofile token: {e}")
+        print("Continuing without gofile upload...")
+        token = None
+        folder_id = None
     else:
-        print("couldnt make a gofile folder, gonna try anyway")
+        folder_id, folder_link, credits_file_id = gofile_make_folder(token)
+        if folder_link:
+            print(f"Gofile: {folder_link}")
+        else:
+            print("Warning: Could not create gofile folder, continuing anyway")
 
     counter = [0]
     counter_lock = threading.Lock()
-    writer = GofileWriter(folder_id, token)
+    writer = GofileWriter(folder_id, token) if token else None
 
     with ThreadPoolExecutor(max_workers=len(tokens)) as executor:
         futures = [
@@ -432,53 +503,71 @@ def create_links(number, github_url, cdn_choice):
         for future in as_completed(futures):
             try:
                 future.result()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Worker error: {e}")
 
-    writer.finish()
-    print("done")
+    if writer:
+        writer.finish()
+    print("Done!")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Heavenlyy")
+        print("CDN Link Generator - Usage:")
+        print("  python gs.py token add        - Add a GitHub token")
+        print("  python gs.py token list       - List saved tokens")
+        print("  python gs.py token remove <n> - Remove token #n")
+        print("  python gs.py create <count> <url> [cdn] - Generate links")
         sys.exit(0)
 
     cmd = sys.argv[1].lower()
 
     if cmd == "token":
         if len(sys.argv) < 3:
+            print("Usage: python gs.py token <add|list|remove> [index]")
             sys.exit(1)
         sub = sys.argv[2].lower()
         if sub == "add":
+            print("Enter your GitHub token:")
             token = input().strip()
             if token:
                 add_token(token)
+            else:
+                print("Error: Token cannot be empty")
         elif sub == "list":
             list_tokens()
         elif sub == "remove":
             if len(sys.argv) < 4:
+                print("Usage: python gs.py token remove <index>")
                 sys.exit(1)
             try:
                 idx = int(sys.argv[3])
+                remove_token(idx)
             except ValueError:
+                print("Error: Index must be a number")
                 sys.exit(1)
-            remove_token(idx)
+        else:
+            print(f"Unknown token command: {sub}")
 
     elif cmd == "create":
         if len(sys.argv) < 3:
+            print("Usage: python gs.py create <count> <url> [cdn]")
             sys.exit(1)
         try:
             number = int(sys.argv[2])
         except ValueError:
+            print("Error: Count must be a number")
             sys.exit(1)
 
-        github_url = sys.argv[3] if len(sys.argv) > 3 else input().strip()
-        cdn_choice = sys.argv[4] if len(sys.argv) > 4 else input().strip()
+        github_url = sys.argv[3] if len(sys.argv) > 3 else input("Enter GitHub URL: ").strip()
+        cdn_choice = sys.argv[4] if len(sys.argv) > 4 else input("Enter CDN choice (1-14, default 1): ").strip()
         if not cdn_choice:
             cdn_choice = "1"
 
         create_links(number, github_url, cdn_choice)
+    else:
+        print(f"Unknown command: {cmd}")
+        print("Run 'python gs.py' for usage information")
 
 
 if __name__ == "__main__":
